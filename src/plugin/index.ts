@@ -11,11 +11,13 @@ import {
   formatModelName,
   categorizeModel,
 } from '../utils/format-model-name'
+import { requiresResponsesAPI } from '../utils/transport'
 import type { LiteLLMModel, LiteLLMModelInfo } from '../types'
 import { getOpenCodeStoredApiKey } from '../utils/opencode-auth'
 import {
   buildCacheKey,
   readModelCache,
+  readModelCacheResponsesIds,
   writeModelCache,
   readModelCacheSavedAt,
 } from '../utils/model-cache'
@@ -25,6 +27,13 @@ import { applyCapabilityOverrides, parseModelCapabilities } from '../utils/model
 import type { ModelCapabilities } from '../utils/model-capabilities'
 
 const CHAT_PROVIDER_ID = 'litellm'
+// The OpenCode 1 config hook can only choose a runtime package per provider,
+// so models that need the Responses API get a sibling provider. OpenCode 2
+// selects the runtime per model instead (see plugin/v2.ts) and never creates
+// this provider. The suffix is reserved: the config hook skips ids that end
+// with it so it never treats its own sibling as a chat provider.
+const RESPONSES_PROVIDER_SUFFIX = '-responses'
+const RESPONSES_NPM = '@ai-sdk/openai'
 // Covers the 3 s health check plus the parallel models/model-info fetch
 // phase, with headroom. Scales with LITELLM_REQUEST_TIMEOUT_MS so slow
 // proxies aren't cut off by the overall cap either (issue #20).
@@ -297,15 +306,28 @@ export function toConfigModel(
 }
 
 /**
+ * Result of discovering a LiteLLM proxy's models.
+ *
+ * `models` is the `{ id -> entry }` map written into an OpenCode provider
+ * config (or translated into `Model.Info` on OpenCode 2). `responsesIds`
+ * lists the subset that must be invoked through the OpenAI Responses API;
+ * callers route those accordingly without inspecting each entry.
+ */
+export interface DiscoveredModels {
+  models: Record<string, unknown>
+  responsesIds: string[]
+}
+
+/**
  * Fetch and build OpenCode model entries from a LiteLLM proxy.
  *
  * Pure with respect to plugin config: it performs the network calls,
- * classifies + formats each model, and returns a `{ id -> entry }` map.
- * The provider's `includeModels`/`excludeModels` filters,
- * `modelCapabilities` overrides and `formatModelNames` choice are
- * applied here (not at merge time) so every path that persists or
- * serves a cache — cold discovery and background refresh — writes the
- * same adjusted view.
+ * classifies + formats each model, and returns the built entries plus the
+ * ids that require the Responses API. The provider's
+ * `includeModels`/`excludeModels` filters, `modelCapabilities` overrides and
+ * `formatModelNames` choice are applied here (not at merge time) so every
+ * path that persists or serves a cache — cold discovery and background
+ * refresh — writes the same adjusted view.
  *
  * Returns `null` when the proxy is unreachable/unauthorized or exposes
  * no models, so callers can distinguish "no data" from "empty result".
@@ -318,7 +340,7 @@ export async function discoverModels(
   filters: ModelFilters = {},
   capabilities: ModelCapabilities = {},
   formatModelNames = true,
-): Promise<Record<string, unknown> | null> {
+): Promise<DiscoveredModels | null> {
   if (!(await checkLiteLLMHealth(baseURL, apiKey, customHeaders))) {
     log(
       'warn',
@@ -368,6 +390,7 @@ export async function discoverModels(
   }
 
   const built: Record<string, unknown> = {}
+  const responsesIds: string[] = []
   let skipped = 0
   let wildcards = 0
   let filtered = 0
@@ -389,16 +412,14 @@ export async function discoverModels(
     }
     const info = infoByName?.get(model.id)
     if (infoByName && !info) unmatched.push(model.id)
-    const entry = toConfigModel(
-      enrichModel(model, info, capabilities[model.id]),
-      info,
-      formatModelNames,
-    )
+    const enriched = enrichModel(model, info, capabilities[model.id])
+    const entry = toConfigModel(enriched, info, formatModelNames)
     if (!entry) {
       skipped++
       continue
     }
     built[model.id] = entry
+    if (requiresResponsesAPI(enriched)) responsesIds.push(model.id)
   }
 
   if (unmatched.length > 0) {
@@ -430,7 +451,7 @@ export async function discoverModels(
       ')',
   )
 
-  return built
+  return { models: built, responsesIds }
 }
 
 /**
@@ -456,6 +477,113 @@ function mergeModels(
 }
 
 /**
+ * Ensure the sibling provider that carries Responses-API models exists in
+ * the OpenCode 1 config, mirroring the chat provider's endpoint and
+ * credentials. Returns its `models` map.
+ *
+ * The Responses runtime is `@ai-sdk/openai` (AI SDK 5's OpenAI provider
+ * defaults to `/v1/responses`). The sibling is only materialized when at
+ * least one discovered model needs it, so chat-only proxies keep a single
+ * provider and never pay for the extra entry.
+ */
+function ensureResponsesProvider(
+  config: { provider: Record<string, unknown> },
+  baseProviderId: string,
+  baseProvider: Record<string, unknown>,
+  baseURL: string,
+  apiKey: string | undefined,
+  customHeaders: Record<string, string> | undefined,
+): Record<string, unknown> {
+  const id = `${baseProviderId}${RESPONSES_PROVIDER_SUFFIX}`
+  if (!config.provider[id] || typeof config.provider[id] !== 'object') {
+    config.provider[id] = {}
+  }
+  const provider = config.provider[id] as Record<string, unknown>
+  if (!provider.npm) provider.npm = RESPONSES_NPM
+  if (typeof provider.name !== 'string' || !provider.name) {
+    const baseName =
+      typeof baseProvider.name === 'string' && baseProvider.name
+        ? baseProvider.name
+        : 'LiteLLM (proxy)'
+    provider.name = `${baseName} Responses`
+  }
+  if (!provider.options || typeof provider.options !== 'object') {
+    provider.options = {}
+  }
+  const options = provider.options as Record<string, unknown>
+  if (!options.baseURL) options.baseURL = `${baseURL}/v1`
+  if (!options.apiKey && apiKey) options.apiKey = apiKey
+  if (
+    customHeaders &&
+    Object.keys(customHeaders).length > 0 &&
+    !options.customHeaders
+  ) {
+    options.customHeaders = customHeaders
+  }
+  if (!provider.models || typeof provider.models !== 'object') {
+    provider.models = {}
+  }
+  return provider.models as Record<string, unknown>
+}
+
+/**
+ * Split freshly discovered entries into the chat provider and the Responses
+ * sibling, injecting each side without clobbering curated entries. Returns
+ * every id this call added, across both providers, so the config hook's
+ * idempotency check sees a single set.
+ */
+function injectDiscoveredModels(
+  config: { provider: Record<string, unknown> },
+  baseProviderId: string,
+  baseProvider: Record<string, unknown>,
+  baseModels: Record<string, unknown>,
+  entries: Record<string, unknown>,
+  responsesIds: readonly string[],
+  baseURL: string,
+  apiKey: string | undefined,
+  customHeaders: Record<string, string> | undefined,
+): string[] {
+  const responsesSet = new Set(responsesIds)
+  const existingSibling = config.provider[`${baseProviderId}${RESPONSES_PROVIDER_SUFFIX}`]
+  const siblingModelsExisting: Record<string, unknown> =
+    existingSibling &&
+    typeof existingSibling === 'object' &&
+    (existingSibling as Record<string, unknown>).models &&
+    typeof (existingSibling as Record<string, unknown>).models === 'object'
+      ? ((existingSibling as Record<string, unknown>).models as Record<string, unknown>)
+      : {}
+
+  const chatEntries: Record<string, unknown> = {}
+  const responsesEntries: Record<string, unknown> = {}
+  for (const [id, entry] of Object.entries(entries)) {
+    // A model already present under the other provider was curated there (or
+    // injected by an earlier run); leave it alone instead of duplicating it
+    // across both providers.
+    if (responsesSet.has(id)) {
+      if (Object.hasOwn(baseModels, id)) continue
+      responsesEntries[id] = entry
+    } else {
+      if (Object.hasOwn(siblingModelsExisting, id)) continue
+      chatEntries[id] = entry
+    }
+  }
+
+  const added = mergeModels(baseModels, chatEntries)
+  if (Object.keys(responsesEntries).length > 0) {
+    const siblingModels = ensureResponsesProvider(
+      config,
+      baseProviderId,
+      baseProvider,
+      baseURL,
+      apiKey,
+      customHeaders,
+    )
+    added.push(...mergeModels(siblingModels, responsesEntries))
+  }
+  return added
+}
+
+/**
  * Revalidate a provider's model cache off the critical path (SWR). The
  * refreshed entries land in the on-disk cache and surface on the next
  * OpenCode start — OpenCode only reads provider config at startup, so
@@ -473,7 +601,7 @@ async function backgroundRefresh(cacheKey: string): Promise<void> {
   }
   refreshInFlight.add(cacheKey)
   try {
-    const built = await withTimeout(
+    const discovered = await withTimeout(
       discoverModels(
         ctx.baseURL,
         ctx.apiKey,
@@ -485,11 +613,11 @@ async function backgroundRefresh(cacheKey: string): Promise<void> {
       ),
       DISCOVERY_TIMEOUT_MS,
     )
-    if (built && Object.keys(built).length > 0) {
-      writeModelCache(cacheKey, built)
+    if (discovered && Object.keys(discovered.models).length > 0) {
+      writeModelCache(cacheKey, discovered.models, discovered.responsesIds)
       log(
         'info',
-        `[opencode-litellm] Background-refreshed model cache for ${ctx.baseURL} (${Object.keys(built).length} models)`,
+        `[opencode-litellm] Background-refreshed model cache for ${ctx.baseURL} (${Object.keys(discovered.models).length} models)`,
       )
     }
   } catch {
@@ -535,6 +663,9 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
       const liteLLMProviders: Array<{ id: string; provider: Record<string, unknown> }> = []
 
       for (const id of providerIds) {
+        // The Responses sibling is created and populated below; never treat
+        // it as a chat provider (that would recurse into `…-responses-responses`).
+        if (id.endsWith(RESPONSES_PROVIDER_SUFFIX)) continue
         const provider = config.provider[id]
         if (provider && typeof provider === 'object') {
           const options = (provider.options ?? {}) as Record<string, unknown>
@@ -659,12 +790,27 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
           providerId,
         })
 
+        // The Responses sibling (if any) holds a disjoint set of ids, so the
+        // idempotency check has to look at both providers.
+        const responsesProviderId = `${providerId}${RESPONSES_PROVIDER_SUFFIX}`
+        const responsesModels = (): Record<string, unknown> => {
+          const sibling = config.provider[responsesProviderId]
+          if (!sibling || typeof sibling !== 'object') return {}
+          const candidate = (sibling as Record<string, unknown>).models
+          return candidate && typeof candidate === 'object'
+            ? (candidate as Record<string, unknown>)
+            : {}
+        }
+
         // Repeat config-hook invocations within a run are a no-op once
         // we've injected this provider's models.
         const alreadyInjected = injectedModelIds.get(cacheKey)
         if (
           alreadyInjected &&
-          [...alreadyInjected].every((id) => Object.hasOwn(models, id))
+          [...alreadyInjected].every(
+            (id) =>
+              Object.hasOwn(models, id) || Object.hasOwn(responsesModels(), id),
+          )
         ) {
           continue
         }
@@ -676,7 +822,17 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
         // the same proxy (with different keys) don't share model lists.
         const cached = readModelCache(cacheKey)
         if (cached && Object.keys(cached).length > 0) {
-          const added = mergeModels(models, cached)
+          const added = injectDiscoveredModels(
+            config,
+            providerId,
+            actualProvider,
+            models,
+            cached,
+            readModelCacheResponsesIds(cacheKey),
+            baseURL,
+            apiKey,
+            customHeaders,
+          )
           injectedModelIds.set(cacheKey, new Set(added))
           log(
             'info',
@@ -688,7 +844,7 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
         // Cold cache: do a live fetch (slow first run only), inject, and
         // persist for subsequent startups. Capped by a timeout so a slow
         // proxy never blocks boot.
-        const built = await withTimeout(
+        const discovered = await withTimeout(
           discoverModels(
             baseURL,
             apiKey,
@@ -700,10 +856,20 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
           ),
           DISCOVERY_TIMEOUT_MS,
         )
-        if (built && Object.keys(built).length > 0) {
-          const added = mergeModels(models, built)
+        if (discovered && Object.keys(discovered.models).length > 0) {
+          const added = injectDiscoveredModels(
+            config,
+            providerId,
+            actualProvider,
+            models,
+            discovered.models,
+            discovered.responsesIds,
+            baseURL,
+            apiKey,
+            customHeaders,
+          )
           injectedModelIds.set(cacheKey, new Set(added))
-          writeModelCache(cacheKey, built)
+          writeModelCache(cacheKey, discovered.models, discovered.responsesIds)
         }
       }
     },

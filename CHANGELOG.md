@@ -36,6 +36,7 @@
 
 ### Features
 
+* route models LiteLLM reports with `mode: "responses"` through the OpenAI Responses API (per-model runtime package on OpenCode 2; a `<provider>-responses` sibling on OpenCode 1)
 * support the OpenCode 2 API with the OpenCode 1 server entrypoint
 * add `formatModelNames` option to keep raw model ids in the picker
 

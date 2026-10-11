@@ -1,4 +1,5 @@
 export * from './litellm-api'
 export * from './format-model-name'
+export * from './transport'
 export * from './model-capabilities'
 export * from './model-filter'
