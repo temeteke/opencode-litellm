@@ -15,6 +15,7 @@ import {
 import {
   buildCacheKey,
   readModelCache,
+  readModelCacheResponsesIds,
   readModelCacheSavedAt,
   writeModelCache,
 } from '../utils/model-cache'
@@ -25,6 +26,14 @@ import type { ModelFilters } from '../utils/model-filter'
 
 const CHAT_PROVIDER_ID = 'litellm'
 const OPENAI_COMPATIBLE_PACKAGE = '@opencode/ai/providers/openai-compatible'
+// Runtime package that talks to `/v1/responses`. OpenCode 2 lets one model
+// override the provider's package, so Responses models stay under their
+// original provider id and no sibling provider is needed here.
+//
+// `@opencode/ai/providers/openai/responses` is the Responses runtime OpenCode
+// bundles today; a plain OpenAI-compatible provider defaults to the Chat
+// Completions runtime, so the override is what selects the Responses API.
+const RESPONSES_PACKAGE = '@opencode/ai/providers/openai/responses'
 const REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000
 
 type ProviderInfo = Awaited<ReturnType<Context['provider']['list']>>['data'][number]
@@ -98,6 +107,7 @@ function numberOrZero(value: unknown): number {
 function toProviderModels(
   providerID: string,
   entries: Record<string, unknown>,
+  responsesIds: ReadonlySet<string> = new Set<string>(),
 ): Model.Info[] {
   const provider = Provider.ID.make(providerID)
 
@@ -138,6 +148,10 @@ function toProviderModels(
     return [
       {
         ...defaults,
+        // A model that targets `/v1/responses` overrides the provider's
+        // runtime package for itself, so it keeps the provider id while
+        // still reaching the Responses API.
+        ...(responsesIds.has(modelID) ? { package: RESPONSES_PACKAGE } : {}),
         name: readString(entry.name) ?? modelID,
         limit: {
           context: numberOrDefault(limit.context, defaults.limit.context),
@@ -270,9 +284,10 @@ async function makeProviderSource(
     formatModelNames,
   })
   let entries = readModelCache(cacheKey)
+  let responsesIds = readModelCacheResponsesIds(cacheKey)
 
   if (!entries || Object.keys(entries).length === 0) {
-    entries = await withTimeout(
+    const discovered = await withTimeout(
       discoverModels(
         baseURL,
         apiKey,
@@ -284,7 +299,14 @@ async function makeProviderSource(
       ),
       DISCOVERY_TIMEOUT_MS,
     )
-    if (entries && Object.keys(entries).length > 0) writeModelCache(cacheKey, entries)
+    if (discovered && Object.keys(discovered.models).length > 0) {
+      entries = discovered.models
+      responsesIds = discovered.responsesIds
+      writeModelCache(cacheKey, entries, responsesIds)
+    } else {
+      entries = null
+      responsesIds = []
+    }
   } else {
     logInfo(
       `[opencode-litellm] Loaded ${Object.keys(entries).length} models from cache for provider "${id}" (${baseURL}); refresh happens in the background on new sessions.`,
@@ -311,7 +333,7 @@ async function makeProviderSource(
     capabilities,
     formatModelNames,
     cacheKey,
-    models: toProviderModels(id, entries ?? {}),
+    models: toProviderModels(id, entries ?? {}, new Set(responsesIds)),
     ownedModelIds: new Set<string>(),
   }
 }
@@ -345,7 +367,7 @@ async function refreshProviderSource(
   let refresh!: Promise<void>
   refresh = (async () => {
     try {
-      const entries = await withTimeout(
+      const discovered = await withTimeout(
         discoverModels(
           source.baseURL,
           apiKey,
@@ -357,11 +379,21 @@ async function refreshProviderSource(
         ),
         DISCOVERY_TIMEOUT_MS,
       )
-      if (!entries || Object.keys(entries).length === 0 || apiKey !== source.apiKey) return
+      if (
+        !discovered ||
+        Object.keys(discovered.models).length === 0 ||
+        apiKey !== source.apiKey
+      ) {
+        return
+      }
 
-      const models = toProviderModels(source.id, entries)
+      const models = toProviderModels(
+        source.id,
+        discovered.models,
+        new Set(discovered.responsesIds),
+      )
       if (JSON.stringify(models) === JSON.stringify(source.models)) {
-        writeModelCache(source.cacheKey, entries)
+        writeModelCache(source.cacheKey, discovered.models, discovered.responsesIds)
         source.refreshRequired = false
         return
       }
@@ -375,7 +407,7 @@ async function refreshProviderSource(
         throw error
       }
 
-      writeModelCache(source.cacheKey, entries)
+      writeModelCache(source.cacheKey, discovered.models, discovered.responsesIds)
       source.refreshRequired = false
       logInfo(
         `[opencode-litellm] Refreshed ${models.length} models for provider "${source.id}"; the provider registry was reloaded.`,

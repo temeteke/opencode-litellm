@@ -8,7 +8,7 @@ import { join } from 'node:path'
  * from older plugin versions are ignored rather than deserialized into
  * an incompatible structure.
  */
-const CACHE_VERSION = 2
+const CACHE_VERSION = 3
 
 /**
  * Maximum age of a cache entry before it's treated as a miss. Without a
@@ -23,6 +23,12 @@ interface ModelCacheFile {
   version: number
   savedAt: number
   models: Record<string, unknown>
+  /**
+   * Model ids that must be invoked through the OpenAI Responses API. Kept
+   * alongside `models` because the provider-config entries themselves carry
+   * no transport marker (their shape is the user-facing OpenCode config).
+   */
+  responsesIds?: string[]
 }
 
 /**
@@ -148,12 +154,30 @@ export function readModelCacheSavedAt(cacheKey: string): number | null {
 }
 
 /**
+ * Return the cached Responses-API model ids for a cache key. Returns an
+ * empty array on any problem (missing file, parse error, version
+ * mismatch), matching {@link readModelCache}'s miss semantics.
+ */
+export function readModelCacheResponsesIds(cacheKey: string): string[] {
+  try {
+    const raw = readFileSync(cacheFile(cacheKey), 'utf8')
+    const parsed = JSON.parse(raw) as ModelCacheFile
+    if (parsed.version !== CACHE_VERSION) return []
+    if (!Array.isArray(parsed.responsesIds)) return []
+    return parsed.responsesIds.filter((id): id is string => typeof id === 'string')
+  } catch {
+    return []
+  }
+}
+
+/**
  * Persist model entries for a cache key. Best-effort: never throws, so
  * a read-only or full filesystem can't break discovery.
  */
 export function writeModelCache(
   cacheKey: string,
   models: Record<string, unknown>,
+  responsesIds: readonly string[] = [],
 ): void {
   try {
     mkdirSync(cacheDir(), { recursive: true })
@@ -161,6 +185,7 @@ export function writeModelCache(
       version: CACHE_VERSION,
       savedAt: Date.now(),
       models,
+      responsesIds: [...responsesIds],
     }
     // Write to a temp file and rename so concurrent OpenCode processes
     // never observe a partially-written JSON file (rename is atomic on

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { readModelCache, readModelCacheSavedAt, writeModelCache, buildCacheKey } from '../src/utils/model-cache'
+import { readModelCache, readModelCacheResponsesIds, readModelCacheSavedAt, writeModelCache, buildCacheKey } from '../src/utils/model-cache'
 
 const KEY = 'litellm@http://localhost:4000'
 
@@ -55,6 +55,18 @@ describe('model cache', () => {
     writeModelCache('b@http://x', { b: {} })
     expect(Object.keys(readModelCache('a@http://x') ?? {})).toEqual(['a'])
     expect(Object.keys(readModelCache('b@http://x') ?? {})).toEqual(['b'])
+  })
+
+  it('round-trips the Responses-API model ids alongside the models', () => {
+    writeModelCache('r@http://x', { chat: {}, responses: {} }, ['responses'])
+    expect(readModelCache('r@http://x')).toEqual({ chat: {}, responses: {} })
+    expect(readModelCacheResponsesIds('r@http://x')).toEqual(['responses'])
+  })
+
+  it('reads an empty Responses id list from a missing or id-less cache', () => {
+    expect(readModelCacheResponsesIds('missing@http://nowhere')).toEqual([])
+    writeModelCache('no-ids@http://x', { m: {} })
+    expect(readModelCacheResponsesIds('no-ids@http://x')).toEqual([])
   })
 
   it('ignores cache files written by a different plugin version', () => {

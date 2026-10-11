@@ -229,12 +229,19 @@ describe('OpenCode 2 plugin entrypoint', () => {
 
     expect(registered[0].models[3]).toMatchObject({
       id: 'company-pro',
+      // `mode: 'responses'` overrides the runtime package for this model only.
+      package: '@opencode/ai/providers/openai/responses',
       variants: [
         { id: 'medium', settings: { reasoningEffort: 'medium' } },
         { id: 'high', settings: { reasoningEffort: 'high' } },
         { id: 'xhigh', settings: { reasoningEffort: 'xhigh' } },
       ],
     })
+
+    // Chat models keep the provider's default package (no per-model override).
+    expect(registered[0].models[0].package).toBeUndefined()
+    expect(registered[0].models[1].package).toBeUndefined()
+    expect(registered[0].models[2].package).toBeUndefined()
 
     await cleanup?.()
     expect(disposeTransform).toHaveBeenCalledOnce()
