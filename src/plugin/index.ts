@@ -513,17 +513,38 @@ function ensureResponsesProvider(
   const options = provider.options as Record<string, unknown>
   if (!options.baseURL) options.baseURL = `${baseURL}/v1`
   if (!options.apiKey && apiKey) options.apiKey = apiKey
-  if (
-    customHeaders &&
-    Object.keys(customHeaders).length > 0 &&
-    !options.customHeaders
-  ) {
-    options.customHeaders = customHeaders
+  // OpenCode 1 reads provider headers from `options.headers` and hands them to
+  // the runtime package (`@ai-sdk/openai` here); it has no `customHeaders` key.
+  // Mirror the chat provider's native headers and promote the plugin's
+  // `customHeaders` so Responses requests carry the same gateway headers.
+  const baseOptions = (baseProvider.options ?? {}) as Record<string, unknown>
+  const mergedHeaders = {
+    ...readHeaderMap(baseOptions.headers),
+    ...(customHeaders ?? {}),
+    ...readHeaderMap(options.headers),
+  }
+  if (Object.keys(mergedHeaders).length > 0) {
+    options.headers = mergedHeaders
   }
   if (!provider.models || typeof provider.models !== 'object') {
     provider.models = {}
   }
   return provider.models as Record<string, unknown>
+}
+
+/**
+ * Extract a `string -> string` header map from an arbitrary provider option
+ * value, ignoring anything that isn't a string. Returns an empty map for
+ * missing or malformed input.
+ */
+function readHeaderMap(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const [key, header] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof header === 'string') out[key] = header
+    }
+  }
+  return out
 }
 
 /**

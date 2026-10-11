@@ -193,4 +193,36 @@ describe('OpenCode 1 config hook', () => {
     expect(Object.keys(config.provider.litellm.models ?? {})).toContain('responses-model')
     expect(config.provider['litellm-responses']).toBeUndefined()
   })
+
+  it('propagates gateway headers to the Responses sibling', async () => {
+    useIsolatedState()
+    const baseURL = 'http://127.0.0.1:45555/v1'
+    mockProxy([{ id: 'responses-model', mode: 'responses' }])
+
+    const input = { client: { app: { log: vi.fn(async () => {}) } } }
+    const plugin = await LiteLLMPlugin(input as never)
+    const config: OpenCodeConfig = {
+      provider: {
+        litellm: {
+          npm: '@ai-sdk/openai-compatible',
+          options: {
+            baseURL,
+            apiKey: 'example-key',
+            headers: { 'CF-Access-Client-Id': 'id-from-base' },
+            customHeaders: { 'X-Legacy': 'legacy' },
+          },
+          models: {},
+        },
+      },
+    }
+
+    await plugin.config!(config as never)
+
+    // OpenCode 1 reads `options.headers`; both the chat provider's native
+    // headers and the plugin's `customHeaders` must reach the sibling.
+    expect(config.provider['litellm-responses'].options?.headers).toMatchObject({
+      'CF-Access-Client-Id': 'id-from-base',
+      'X-Legacy': 'legacy',
+    })
+  })
 })
