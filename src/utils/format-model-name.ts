@@ -77,6 +77,10 @@ export function categorizeModel(model: LiteLLMModel): 'chat' | 'embedding' | 'im
     if (m.includes('image')) return 'image'
     if (m.includes('audio') || m.includes('speech') || m.includes('transcription')) return 'audio'
     if (m.includes('chat') || m.includes('completion')) return 'chat'
+    // `mode: 'responses'` (and anything else non-modal) is a chat-shaped
+    // model — it must fall through to the id heuristics and default to
+    // 'chat' below, never be dropped as non-chat. Transport routing is a
+    // separate concern (see utils/transport.ts).
   }
 
   const id = model.id.toLowerCase()

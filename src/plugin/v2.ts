@@ -14,8 +14,7 @@ import {
 } from './index'
 import {
   buildCacheKey,
-  readModelCache,
-  readModelCacheResponsesIds,
+  readModelCacheEntry,
   readModelCacheSavedAt,
   writeModelCache,
 } from '../utils/model-cache'
@@ -33,6 +32,14 @@ const OPENAI_COMPATIBLE_PACKAGE = '@opencode/ai/providers/openai-compatible'
 // `@opencode/ai/providers/openai/responses` is the Responses runtime OpenCode
 // bundles today; a plain OpenAI-compatible provider defaults to the Chat
 // Completions runtime, so the override is what selects the Responses API.
+//
+// Note this is the OpenAI-specific runtime: it applies OpenAI request defaults
+// (`store: false`, plus `reasoningEffort`/`reasoningSummary`/encrypted-reasoning
+// `include` for `gpt-5*` ids) on top of the proxy endpoint. The provider-neutral
+// `@opencode/ai/providers/openai-compatible/responses` is the closer match for a
+// generic LiteLLM proxy, but it must actually load in the target OpenCode 2.x
+// (`@opencode/ai@2.0.19` ships both). Verified live against the OpenAI runtime;
+// switch here if the compatible variant becomes reliably available.
 const RESPONSES_PACKAGE = '@opencode/ai/providers/openai/responses'
 const REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000
 
@@ -283,8 +290,9 @@ async function makeProviderSource(
   const cacheKey = buildCacheKey(id, baseURL, filters, capabilities, {
     formatModelNames,
   })
-  let entries = readModelCache(cacheKey)
-  let responsesIds = readModelCacheResponsesIds(cacheKey)
+  const cacheEntry = readModelCacheEntry(cacheKey)
+  let entries = cacheEntry?.models ?? null
+  let responsesIds = cacheEntry?.responsesIds ?? []
 
   if (!entries || Object.keys(entries).length === 0) {
     const discovered = await withTimeout(

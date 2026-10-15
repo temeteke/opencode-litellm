@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { readModelCache, readModelCacheResponsesIds, readModelCacheSavedAt, writeModelCache, buildCacheKey } from '../src/utils/model-cache'
+import { readModelCache, readModelCacheEntry, readModelCacheResponsesIds, readModelCacheSavedAt, writeModelCache, buildCacheKey } from '../src/utils/model-cache'
 
 const KEY = 'litellm@http://localhost:4000'
 
@@ -67,6 +67,15 @@ describe('model cache', () => {
     expect(readModelCacheResponsesIds('missing@http://nowhere')).toEqual([])
     writeModelCache('no-ids@http://x', { m: {} })
     expect(readModelCacheResponsesIds('no-ids@http://x')).toEqual([])
+  })
+
+  it('reads models and Responses ids together in one entry', () => {
+    expect(readModelCacheEntry('missing@http://nowhere')).toBeNull()
+    writeModelCache('entry@http://x', { chat: {}, responses: {} }, ['responses'])
+    expect(readModelCacheEntry('entry@http://x')).toEqual({
+      models: { chat: {}, responses: {} },
+      responsesIds: ['responses'],
+    })
   })
 
   it('ignores cache files written by a different plugin version', () => {

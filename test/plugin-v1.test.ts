@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LiteLLMPlugin } from '../src/plugin'
+import { buildCacheKey, writeModelCache } from '../src/utils/model-cache'
 import { __resetOpenCodeAuthCacheForTests } from '../src/utils/opencode-auth'
 
 interface ProviderConfig {
@@ -224,5 +225,98 @@ describe('OpenCode 1 config hook', () => {
       'CF-Access-Client-Id': 'id-from-base',
       'X-Legacy': 'legacy',
     })
+  })
+
+  it('sends the provider native headers on discovery too', async () => {
+    useIsolatedState()
+    const baseURL = 'http://127.0.0.1:45557/v1'
+    const seen: Array<Record<string, string>> = []
+    globalThis.fetch = vi.fn(async (input, init) => {
+      const url = String(input)
+      seen.push((init?.headers ?? {}) as Record<string, string>)
+      if (url.endsWith('/v1/model/info')) {
+        return new Response(JSON.stringify({ data: [] }), { status: 200 })
+      }
+      return new Response(
+        JSON.stringify({ data: [{ id: 'chat-model', object: 'model' }] }),
+        { status: 200 },
+      )
+    })
+
+    const input = { client: { app: { log: vi.fn(async () => {}) } } }
+    const plugin = await LiteLLMPlugin(input as never)
+    const config: OpenCodeConfig = {
+      provider: {
+        litellm: {
+          npm: '@ai-sdk/openai-compatible',
+          options: {
+            baseURL,
+            apiKey: 'example-key',
+            headers: { 'CF-Access-Client-Id': 'id-from-base' },
+          },
+          models: {},
+        },
+      },
+    }
+
+    await plugin.config!(config as never)
+
+    // A gateway configured only via the native `headers` map must still see
+    // them on the plugin's own health/models fetches, not just the runtime.
+    expect(seen.length).toBeGreaterThan(0)
+    for (const headers of seen) {
+      expect(headers['CF-Access-Client-Id']).toBe('id-from-base')
+    }
+  })
+
+  it('routes cached Responses models to the sibling on the fast path', async () => {
+    useIsolatedState()
+    const baseURL = 'http://127.0.0.1:45556/v1'
+    // The cached path must not touch the network at all.
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error('network should not be hit on the cached path')
+    })
+    const cacheKey = buildCacheKey('litellm', 'http://127.0.0.1:45556', {}, {}, {
+      formatModelNames: true,
+    })
+    writeModelCache(
+      cacheKey,
+      { 'chat-model': { name: 'Chat' }, 'responses-model': { name: 'Resp' } },
+      ['responses-model'],
+    )
+
+    const config = await runConfigHook(baseURL)
+
+    expect(Object.keys(config.provider.litellm.models ?? {})).toEqual(['chat-model'])
+    expect(Object.keys(config.provider['litellm-responses'].models ?? {})).toEqual([
+      'responses-model',
+    ])
+  })
+
+  it('creates no sibling when the only Responses model is filtered out', async () => {
+    useIsolatedState()
+    const baseURL = 'http://127.0.0.1:45558/v1'
+    mockProxy([{ id: 'responses-model', mode: 'responses' }])
+
+    const input = { client: { app: { log: vi.fn(async () => {}) } } }
+    const plugin = await LiteLLMPlugin(input as never)
+    const config: OpenCodeConfig = {
+      provider: {
+        litellm: {
+          npm: '@ai-sdk/openai-compatible',
+          options: {
+            baseURL,
+            apiKey: 'example-key',
+            excludeModels: ['responses-*'],
+          },
+          models: {},
+        },
+      },
+    }
+
+    await plugin.config!(config as never)
+
+    expect(config.provider.litellm.models ?? {}).toEqual({})
+    expect(config.provider['litellm-responses']).toBeUndefined()
   })
 })

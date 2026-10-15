@@ -16,8 +16,7 @@ import type { LiteLLMModel, LiteLLMModelInfo } from '../types'
 import { getOpenCodeStoredApiKey } from '../utils/opencode-auth'
 import {
   buildCacheKey,
-  readModelCache,
-  readModelCacheResponsesIds,
+  readModelCacheEntry,
   writeModelCache,
   readModelCacheSavedAt,
 } from '../utils/model-cache'
@@ -157,6 +156,27 @@ export function readCustomHeaders(
     return Object.keys(out).length > 0 ? out : undefined
   }
   return undefined
+}
+
+/**
+ * Collect the gateway headers a provider needs on *every* request — both the
+ * plugin's own discovery fetches and the completion-time runtime.
+ *
+ * OpenCode 1 hands the provider's native `options.headers` to the runtime
+ * package, but the plugin's discovery fetches historically read only the
+ * legacy `customHeaders` key. A gateway that authenticates via
+ * `options.headers` (e.g. Cloudflare Access) would therefore serve
+ * completions while every discovery call 401s. Merge both here, with
+ * `customHeaders` winning on conflict, so discovery and runtime agree.
+ */
+export function readProviderHeaders(
+  options: Record<string, unknown>,
+): Record<string, string> | undefined {
+  const merged = {
+    ...readHeaderMap(options.headers),
+    ...(readCustomHeaders(options) ?? {}),
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined
 }
 
 /**
@@ -733,7 +753,10 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
         */
         const storedKey = await getOpenCodeStoredApiKey(providerId)
         const apiKey = configuredKey ?? envKey ?? storedKey
-        const customHeaders = readCustomHeaders(options)
+        // Native `options.headers` and the legacy `customHeaders` both reach
+        // discovery and the runtime, so a gateway that only sets one still
+        // authenticates the plugin's own fetches.
+        const customHeaders = readProviderHeaders(options)
         const filters = readModelFilters(options)
         const capabilities = parseModelCapabilities(options.modelCapabilities)
         const formatModelNames = readFormatModelNames(options)
@@ -841,15 +864,15 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
         // `event` hook) keeps the cache fresh for the next launch.
         // The cache is scoped per provider so two providers pointing at
         // the same proxy (with different keys) don't share model lists.
-        const cached = readModelCache(cacheKey)
-        if (cached && Object.keys(cached).length > 0) {
+        const cached = readModelCacheEntry(cacheKey)
+        if (cached && Object.keys(cached.models).length > 0) {
           const added = injectDiscoveredModels(
             config,
             providerId,
             actualProvider,
             models,
-            cached,
-            readModelCacheResponsesIds(cacheKey),
+            cached.models,
+            cached.responsesIds,
             baseURL,
             apiKey,
             customHeaders,
@@ -857,7 +880,7 @@ export const LiteLLMPlugin: Plugin = async (input: PluginInput) => {
           injectedModelIds.set(cacheKey, new Set(added))
           log(
             'info',
-            `[opencode-litellm] Loaded ${Object.keys(cached).length} models from cache for provider "${providerId}" (${baseURL}); refresh happens in the background on new sessions.`,
+            `[opencode-litellm] Loaded ${Object.keys(cached.models).length} models from cache for provider "${providerId}" (${baseURL}); refresh happens in the background on new sessions.`,
           )
           continue
         }

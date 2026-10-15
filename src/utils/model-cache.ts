@@ -111,6 +111,30 @@ export function buildCacheKey(
 }
 
 /**
+ * Read and validate a cache file once. Returns `null` on any problem
+ * (missing file, parse error, version mismatch, or a missing `models`
+ * block). Every reader below shares this so a caller that needs both the
+ * models and the Responses ids parses the file a single time.
+ */
+function readCacheFile(cacheKey: string): ModelCacheFile | null {
+  try {
+    const raw = readFileSync(cacheFile(cacheKey), 'utf8')
+    const parsed = JSON.parse(raw) as ModelCacheFile
+    if (parsed.version !== CACHE_VERSION) return null
+    if (!parsed.models || typeof parsed.models !== 'object') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/** Keep only the string entries of a cached `responsesIds` list. */
+function normalizeResponsesIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((id): id is string => typeof id === 'string')
+}
+
+/**
  * Read cached model entries for a cache key. Returns `null` on any
  * problem (missing file, parse error, version mismatch, or an entry
  * older than `CACHE_MAX_AGE_MS`) — the caller treats that as a cache
@@ -119,21 +143,35 @@ export function buildCacheKey(
 export function readModelCache(
   cacheKey: string,
 ): Record<string, unknown> | null {
-  try {
-    const raw = readFileSync(cacheFile(cacheKey), 'utf8')
-    const parsed = JSON.parse(raw) as ModelCacheFile
-    if (parsed.version !== CACHE_VERSION) return null
-    if (!parsed.models || typeof parsed.models !== 'object') return null
-    if (
-      typeof parsed.savedAt !== 'number' ||
-      Date.now() - parsed.savedAt > CACHE_MAX_AGE_MS
-    ) {
-      return null
-    }
-    return parsed.models
-  } catch {
+  const parsed = readCacheFile(cacheKey)
+  if (!parsed) return null
+  if (
+    typeof parsed.savedAt !== 'number' ||
+    Date.now() - parsed.savedAt > CACHE_MAX_AGE_MS
+  ) {
     return null
   }
+  return parsed.models
+}
+
+/**
+ * Read the models and Responses-API model ids for a cache key in one
+ * parse. Returns `null` under the same conditions as
+ * {@link readModelCache} (missing/expired cache), so the two can't
+ * disagree within a single lookup.
+ */
+export function readModelCacheEntry(
+  cacheKey: string,
+): { models: Record<string, unknown>; responsesIds: string[] } | null {
+  const parsed = readCacheFile(cacheKey)
+  if (!parsed) return null
+  if (
+    typeof parsed.savedAt !== 'number' ||
+    Date.now() - parsed.savedAt > CACHE_MAX_AGE_MS
+  ) {
+    return null
+  }
+  return { models: parsed.models, responsesIds: normalizeResponsesIds(parsed.responsesIds) }
 }
 
 /**
@@ -142,15 +180,9 @@ export function readModelCache(
  * background refreshes so still-fresh caches aren't re-fetched.
  */
 export function readModelCacheSavedAt(cacheKey: string): number | null {
-  try {
-    const raw = readFileSync(cacheFile(cacheKey), 'utf8')
-    const parsed = JSON.parse(raw) as ModelCacheFile
-    if (parsed.version !== CACHE_VERSION) return null
-    if (typeof parsed.savedAt !== 'number') return null
-    return parsed.savedAt
-  } catch {
-    return null
-  }
+  const parsed = readCacheFile(cacheKey)
+  if (!parsed || typeof parsed.savedAt !== 'number') return null
+  return parsed.savedAt
 }
 
 /**
@@ -159,15 +191,9 @@ export function readModelCacheSavedAt(cacheKey: string): number | null {
  * mismatch), matching {@link readModelCache}'s miss semantics.
  */
 export function readModelCacheResponsesIds(cacheKey: string): string[] {
-  try {
-    const raw = readFileSync(cacheFile(cacheKey), 'utf8')
-    const parsed = JSON.parse(raw) as ModelCacheFile
-    if (parsed.version !== CACHE_VERSION) return []
-    if (!Array.isArray(parsed.responsesIds)) return []
-    return parsed.responsesIds.filter((id): id is string => typeof id === 'string')
-  } catch {
-    return []
-  }
+  const parsed = readCacheFile(cacheKey)
+  if (!parsed) return []
+  return normalizeResponsesIds(parsed.responsesIds)
 }
 
 /**
