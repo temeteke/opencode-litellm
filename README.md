@@ -240,20 +240,23 @@ between effort levels from the model picker without hand-curating every entry.
 
 > **Note**: OpenAI's reasoning-tier models (gpt-5, o1, o3, o4) reject
 > requests that combine `reasoning_effort` with function tools on
-> `/v1/chat/completions`. Enable the Responses API for such a model on the
-> LiteLLM side (`use_responses_api: true` in its `litellm_params`) and the
-> plugin routes it automatically; otherwise reach it without
-> `reasoningEffort`. See the FAQ entry below.
+> `/v1/chat/completions`. When LiteLLM reports such a model with
+> `mode: "responses"` the plugin routes it to `/v1/responses` automatically;
+> otherwise reach it without `reasoningEffort`. See the FAQ entry below.
 
 ### Responses API models
 
 LiteLLM reports `mode` per model on `/v1/model/info` (the plugin fetches it
-alongside `/v1/models`). When a model's `mode` is `responses` — usually after
-you enable the Responses API for it in LiteLLM, e.g.
-`use_responses_api: true` — the plugin routes that model to `/v1/responses`
-instead of `/v1/chat/completions`. Only the reported `mode` is used; the plugin
-does not guess from the model id, so an alias that merely looks like a reasoning
-model stays on the transport LiteLLM actually serves it from.
+alongside `/v1/models`). When a model's `mode` is `responses`, the plugin routes
+that model to `/v1/responses` instead of `/v1/chat/completions`. Only the
+reported `mode` is used; the plugin does not guess from the model id, so an alias
+that merely looks like a reasoning model stays on the transport LiteLLM actually
+serves it from.
+
+`mode` comes from LiteLLM's model cost map / the model's configured mode, not
+from `use_responses_api`. If a model you expect to be routed isn't, check
+`GET /v1/model/info` and confirm its `model_info.mode` is `responses` for the
+deployment the proxy exposes under that id.
 
 The routing is applied without any extra configuration, and it differs by
 OpenCode version because the two versions pick a runtime package differently:
@@ -273,6 +276,13 @@ does not manage any provider whose id ends with `-responses`; pick a different
 name if you want the plugin to discover models into a provider of your own.
 Selecting a Responses model on OpenCode 1 therefore means picking
 `<provider>-responses/<model>` rather than `<provider>/<model>`.
+
+> **Upgrading on OpenCode 1 (model-id change).** Before this routing existed, a
+> Responses-tier model was reachable as `<provider>/<model>` (over Chat
+> Completions). It now lives under `<provider>-responses/<model>`. Any saved
+> session, agent, or `opencode.json` reference that hard-codes the old
+> `<provider>/<model>` id needs to be repointed, or it will fail to resolve.
+> OpenCode 2 is unaffected — the model keeps its provider id.
 
 > **Hand-curated models on OpenCode 1.** OpenCode 1 chooses the runtime per
 > provider, so routing a model to the Responses API means putting it in the
@@ -561,9 +571,9 @@ The `customHeaders` map works for any gateway that requires extra HTTP headers �
 <details>
 <summary><b>I get <code>Function tools with reasoning_effort are not supported … in /v1/chat/completions</code> — what do I do?</b></summary>
 
-This error comes from OpenAI: their reasoning-tier models (gpt-5, o1, o3, o4) refuse function-tool calls on `/v1/chat/completions` when `reasoning_effort` is set. When LiteLLM reports such a model with `mode: "responses"` — for example after setting `use_responses_api: true` in its `litellm_params` — the plugin sends that model to `/v1/responses` and the error goes away. See [Responses API models](#responses-api-models).
+This error comes from OpenAI: their reasoning-tier models (gpt-5, o1, o3, o4) refuse function-tool calls on `/v1/chat/completions` when `reasoning_effort` is set. When LiteLLM reports such a model with `mode: "responses"`, the plugin sends that model to `/v1/responses` and the error goes away. See [Responses API models](#responses-api-models).
 
-- If the model isn't routed, confirm `/v1/model/info` reports `mode: "responses"` for it. The plugin acts only on that signal and does not guess from the model id.
+- If the model isn't routed, confirm `/v1/model/info` reports `model_info.mode: "responses"` for it. `mode` comes from LiteLLM's model cost map / the model's configured mode — setting `use_responses_api: true` in `litellm_params` does not by itself change it. The plugin acts only on the reported `mode` and does not guess from the model id.
 - If you'd rather stay on Chat Completions, leave the model's `reasoningEffort` unset in OpenCode (don't pick a reasoning-effort variant for it).
 
 If your model id doesn't look like a reasoning model to LiteLLM (e.g. you renamed it), also check that its `model_info` in `litellm config.yaml` carries the right `supports_*` flags.

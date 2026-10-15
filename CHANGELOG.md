@@ -28,6 +28,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+* On OpenCode 1, models LiteLLM reports with `mode: "responses"` move to a `<provider>-responses` sibling provider, so their model id changes from `<provider>/<model>` to `<provider>-responses/<model>`. Update saved sessions, agents, and `opencode.json` references that hard-code the old id. OpenCode 2 is unaffected.
+
 ### Bug Fixes
 
 * restore baseline reasoning-effort variants from sparse LiteLLM metadata (including GPT-6 Astra), respect explicit effort lists and disabled levels
